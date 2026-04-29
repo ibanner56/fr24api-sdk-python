@@ -96,6 +96,7 @@ class HttpTransport:
         self._lock = threading.Lock()
         self._drained = threading.Condition(self._lock)
         self._closed = False
+        self._close_pending = False
         self._active = _ActiveClient(http_client or self._build_client())
 
     @property
@@ -272,11 +273,14 @@ class HttpTransport:
             if self._closed:
                 return
             self._closed = True
+            self._close_pending = True
             ref = self._active
             while ref.inflight > 0:
                 self._drained.wait()
-        if not ref.client.is_closed:
-            ref.client.close()
+            if not ref.client.is_closed:
+                ref.client.close()
+            self._close_pending = False
+            self._drained.notify_all()
 
     def reset(self) -> None:
         """Closes the current HTTP client and creates a fresh one.
@@ -305,6 +309,9 @@ class HttpTransport:
             )
         new_client = self._build_client()
         with self._lock:
+            # If close() is actively draining, wait for it to finish first.
+            while self._close_pending:
+                self._drained.wait()
             old_ref = self._active
             self._active = _ActiveClient(new_client)
             self._closed = False

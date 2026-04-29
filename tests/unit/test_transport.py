@@ -645,3 +645,22 @@ def test_concurrent_reset_and_request_no_deadlock():
     assert not trans._client.is_closed
     assert trans._client is not old_client
     trans.close()
+
+
+def test_request_rejected_after_concurrent_close_and_reset():
+    """close() fully completes before reset() can reopen the transport."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    trans.close()
+
+    # After close(), requests should fail
+    with pytest.raises(TransportError, match="Transport is closed"):
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
+
+    # reset() reopens the transport
+    trans.reset()
+    assert not trans._client.is_closed
+
+    # Now close again — should be final
+    trans.close()
+    with pytest.raises(TransportError, match="Transport is closed"):
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
