@@ -6,6 +6,7 @@
 import os
 import socket
 import logging
+import threading
 from typing import Any, Optional, Union, Mapping, Sequence, Type
 
 import httpx
@@ -56,6 +57,16 @@ def _build_socket_options() -> list[tuple[int, int, int]]:
     return options
 
 
+class _ActiveClient:
+    """Pairs an httpx.Client with its in-flight request count."""
+
+    __slots__ = ("client", "inflight")
+
+    def __init__(self, client: httpx.Client) -> None:
+        self.client = client
+        self.inflight = 0
+
+
 class HttpTransport:
     """Manages HTTP requests to the Flightradar24 API, including auth and error handling."""
 
@@ -82,7 +93,16 @@ class HttpTransport:
         self._retries = retries
         self._owns_client: bool = http_client is None
 
-        self._client: httpx.Client = http_client or self._build_client()
+        self._lock = threading.Lock()
+        self._drained = threading.Condition(self._lock)
+        self._closed = False
+        self._close_pending = False
+        self._active = _ActiveClient(http_client or self._build_client())
+
+    @property
+    def _client(self) -> httpx.Client:
+        """The current underlying httpx.Client."""
+        return self._active.client
 
     @property
     def timeout(self) -> Union[float, httpx.Timeout]:
@@ -124,7 +144,7 @@ class HttpTransport:
     ) -> httpx.Response:
         """Makes an HTTP request to the API."""
 
-        # Check if API token is available before making the request
+        # Check before acquiring the lock — avoids locking on a missing key.
         if not self.api_token:
             raise NoApiKeyError(
                 "No API key provided. Please set the FR24_API_TOKEN environment variable "
@@ -132,53 +152,69 @@ class HttpTransport:
                 "For more information, see https://fr24api.flightradar24.com/docs"
             )
 
-        request_headers = self._get_default_headers()
-        if headers:
-            request_headers.update(headers)
-
-        log_url = f"{str(self._client.base_url).rstrip('/')}/{path.lstrip('/')}"
-
-        logger.debug(
-            f"Request: {method} {log_url} Params: {params} JSON: {json_data} Headers: {request_headers}"
-        )
+        with self._lock:
+            if self._closed:
+                raise TransportError(
+                    "Transport is closed",
+                    request=httpx.Request(method, path),
+                )
+            ref = self._active
+            ref.inflight += 1
 
         try:
-            response = self._client.request(
-                method=method,
-                url=path,
-                params=params,
-                json=json_data,
-                headers=request_headers,
-            )
+            client = ref.client
+            request_headers = self._get_default_headers()
+            if headers:
+                request_headers.update(headers)
+
+            log_url = f"{str(client.base_url).rstrip('/')}/{path.lstrip('/')}"
+
             logger.debug(
-                f"Response: {response.status_code} {response.reason_phrase} "
-                f"URL: {response.url} Headers: {response.headers}"
+                f"Request: {method} {log_url} Params: {params} JSON: {json_data} Headers: {request_headers}"
             )
-            if logger.isEnabledFor(logging.DEBUG):
-                try:
-                    debug_body = response.json()
-                except ValueError:
-                    debug_body = response.text[:500] + (
-                        "... (truncated)" if len(response.text) > 500 else ""
-                    )
-                logger.debug(f"Response body: {debug_body}")
 
-            response.raise_for_status()
-            return response
+            try:
+                response = client.request(
+                    method=method,
+                    url=path,
+                    params=params,
+                    json=json_data,
+                    headers=request_headers,
+                )
+                logger.debug(
+                    f"Response: {response.status_code} {response.reason_phrase} "
+                    f"URL: {response.url} Headers: {response.headers}"
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        debug_body = response.json()
+                    except ValueError:
+                        debug_body = response.text[:500] + (
+                            "... (truncated)" if len(response.text) > 500 else ""
+                        )
+                    logger.debug(f"Response body: {debug_body}")
 
-        except httpx.HTTPStatusError as e:
-            self._handle_http_status_error(e)
-            raise  # Should be unreachable due to _handle_http_status_error always raising
-        except httpx.TimeoutException as e:  # Catch specific httpx errors
-            logger.error(f"Request timed out: {method} {log_url}")
-            raise TransportError(
-                f"Request timed out: {method} {log_url}", request=e.request
-            ) from e
-        except httpx.RequestError as e:
-            logger.error(f"Request failed: {method} {log_url} - {e}")
-            raise TransportError(
-                f"Request failed: {method} {log_url} - {e}", request=e.request
-            ) from e
+                response.raise_for_status()
+                return response
+
+            except httpx.HTTPStatusError as e:
+                self._handle_http_status_error(e)
+                raise  # Should be unreachable due to _handle_http_status_error always raising
+            except httpx.TimeoutException as e:  # Catch specific httpx errors
+                logger.error(f"Request timed out: {method} {log_url}")
+                raise TransportError(
+                    f"Request timed out: {method} {log_url}", request=e.request
+                ) from e
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {method} {log_url} - {e}")
+                raise TransportError(
+                    f"Request failed: {method} {log_url} - {e}", request=e.request
+                ) from e
+        finally:
+            with self._lock:
+                ref.inflight -= 1
+                if ref.inflight == 0:
+                    self._drained.notify_all()
 
     def _handle_http_status_error(self, exc: httpx.HTTPStatusError) -> None:
         """Maps HTTPStatusError to a more specific ApiError subclass and raises it."""
@@ -225,17 +261,45 @@ class HttpTransport:
         ) from exc
 
     def close(self) -> None:
-        """Closes the underlying HTTP client."""
-        if hasattr(self, "_client") and self._client and not self._client.is_closed:
-            self._client.close()
+        """Closes the underlying HTTP client.
+
+        Waits for any in-flight requests to complete before closing.
+        Subsequent calls to :meth:`request` will raise
+        :class:`~fr24sdk.exceptions.TransportError`.  Concurrent callers
+        block until the close is fully complete.
+        """
+        if not hasattr(self, "_active"):
+            return
+        with self._lock:
+            if self._close_pending:
+                # Another thread is already closing — wait for it.
+                while self._close_pending:
+                    self._drained.wait()
+                return
+            if self._closed:
+                return
+            self._closed = True
+            self._close_pending = True
+            ref = self._active
+            while ref.inflight > 0:
+                self._drained.wait()
+            try:
+                if not ref.client.is_closed:
+                    ref.client.close()
+            finally:
+                self._close_pending = False
+                self._drained.notify_all()
 
     def reset(self) -> None:
         """Closes the current HTTP client and creates a fresh one.
 
         Useful for long-running processes on resource-constrained devices
         where periodic connection pool recycling can prevent socket
-        accumulation. Not thread-safe — do not call while requests are
-        in-flight.
+        accumulation.
+
+        Thread-safe: waits for in-flight requests on the old client to
+        complete before closing it.  New requests that arrive during the
+        wait will use the replacement client immediately.
 
         May be called after :meth:`close` — the transport will be
         reopened with the original configuration.
@@ -251,8 +315,18 @@ class HttpTransport:
                 "user-supplied http_client. Close and recreate the "
                 "Client instead."
             )
-        self.close()
-        self._client = self._build_client()
+        new_client = self._build_client()
+        with self._lock:
+            # If close() is actively draining, wait for it to finish first.
+            while self._close_pending:
+                self._drained.wait()
+            old_ref = self._active
+            self._active = _ActiveClient(new_client)
+            self._closed = False
+            while old_ref.inflight > 0:
+                self._drained.wait()
+        if not old_ref.client.is_closed:
+            old_ref.client.close()
         logger.debug("HTTP connection pool reset.")
 
     def __enter__(self) -> "HttpTransport":

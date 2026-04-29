@@ -503,3 +503,268 @@ def test_reset_preserves_retries_and_socket_options():
     sock_opts = trans._client._transport._pool._socket_options
     assert (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1) in sock_opts
     trans.close()
+
+
+# --- Thread-safety tests ---
+
+
+def test_request_after_close_raises():
+    """request() raises TransportError after close()."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    trans.close()
+    with pytest.raises(TransportError, match="Transport is closed"):
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
+
+
+def test_close_is_idempotent():
+    """Calling close() multiple times does not raise."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    trans.close()
+    trans.close()  # Should not raise
+
+
+def test_reset_after_close_reopens():
+    """reset() after close() makes the transport usable again."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    trans.close()
+    trans.reset()
+    assert not trans._client.is_closed
+
+
+@respx_mock
+def test_reset_waits_for_inflight_request():
+    """reset() waits for an in-flight request to complete before closing the old client."""
+    import threading
+    import time
+
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    old_client = trans._client
+
+    request_started = threading.Event()
+    request_may_finish = threading.Event()
+    request_result: dict[str, Any] = {}
+
+    def slow_response(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        request_may_finish.wait(timeout=5)
+        return httpx.Response(200, json={"ok": True})
+
+    respx_mock.get(FULL_TEST_URL).mock(side_effect=slow_response)
+
+    def do_request() -> None:
+        try:
+            resp = trans.request("GET", TEST_API_ENDPOINT_PATH)
+            request_result["status"] = resp.status_code
+        except Exception as exc:
+            request_result["error"] = exc
+
+    # Start a request in a background thread
+    req_thread = threading.Thread(target=do_request)
+    req_thread.start()
+    request_started.wait(timeout=5)
+
+    # Start reset in another thread — it should block until the request finishes
+    reset_done = threading.Event()
+
+    def do_reset() -> None:
+        trans.reset()
+        reset_done.set()
+
+    reset_thread = threading.Thread(target=do_reset)
+    reset_thread.start()
+
+    # Give reset() a moment to reach the drain-wait
+    time.sleep(0.1)
+    assert not reset_done.is_set(), "reset() should be waiting for in-flight request"
+
+    # Let the request finish
+    request_may_finish.set()
+    req_thread.join(timeout=5)
+    reset_thread.join(timeout=5)
+
+    # The request should have succeeded on the OLD client
+    assert request_result.get("status") == 200
+    # The old client should now be closed
+    assert old_client.is_closed
+    # The transport should have a new, open client
+    assert not trans._client.is_closed
+    assert trans._client is not old_client
+    trans.close()
+
+
+@respx_mock
+def test_concurrent_reset_and_request_no_deadlock():
+    """reset() during an in-flight request completes without deadlock."""
+    import threading
+
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    old_client = trans._client
+
+    request_started = threading.Event()
+    request_may_finish = threading.Event()
+    request_result: dict[str, Any] = {}
+
+    def slow_response(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        request_may_finish.wait(timeout=5)
+        return httpx.Response(200, json={"slow": True})
+
+    respx_mock.get(FULL_TEST_URL).mock(side_effect=slow_response)
+
+    def do_slow_request() -> None:
+        try:
+            resp = trans.request("GET", TEST_API_ENDPOINT_PATH)
+            request_result["status"] = resp.status_code
+        except Exception as exc:
+            request_result["error"] = exc
+
+    slow_thread = threading.Thread(target=do_slow_request)
+    slow_thread.start()
+    request_started.wait(timeout=5)
+
+    # Start reset in another thread — it will block until the slow request drains
+    reset_done = threading.Event()
+
+    def do_reset() -> None:
+        trans.reset()
+        reset_done.set()
+
+    reset_thread = threading.Thread(target=do_reset)
+    reset_thread.start()
+
+    # Let the slow request finish — both threads should complete
+    request_may_finish.set()
+    slow_thread.join(timeout=5)
+    reset_thread.join(timeout=5)
+
+    # Both threads completed without deadlock
+    assert reset_done.is_set()
+    assert request_result.get("status") == 200
+    # Old client closed, transport has a fresh client
+    assert old_client.is_closed
+    assert not trans._client.is_closed
+    assert trans._client is not old_client
+    trans.close()
+
+
+def test_request_rejected_after_concurrent_close_and_reset():
+    """close() fully completes before reset() can reopen the transport."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    trans.close()
+
+    # After close(), requests should fail
+    with pytest.raises(TransportError, match="Transport is closed"):
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
+
+    # reset() reopens the transport
+    trans.reset()
+    assert not trans._client.is_closed
+
+    # Now close again — should be final
+    trans.close()
+    with pytest.raises(TransportError, match="Transport is closed"):
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
+
+
+@respx_mock
+def test_concurrent_close_waits_for_inflight():
+    """close() blocks until in-flight requests finish, even from another thread."""
+    import threading
+
+    trans = HttpTransport(api_token=TEST_TOKEN)
+
+    request_started = threading.Event()
+    request_may_finish = threading.Event()
+    close_returned = threading.Event()
+
+    def slow_response(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        request_may_finish.wait(timeout=5)
+        return httpx.Response(200, json={"ok": True})
+
+    respx_mock.get(FULL_TEST_URL).mock(side_effect=slow_response)
+
+    request_result: dict[str, Any] = {}
+
+    def do_request() -> None:
+        try:
+            resp = trans.request("GET", TEST_API_ENDPOINT_PATH)
+            request_result["status"] = resp.status_code
+        except Exception as exc:
+            request_result["error"] = exc
+
+    req_thread = threading.Thread(target=do_request)
+    req_thread.start()
+    request_started.wait(timeout=5)
+
+    # Start close in another thread — should block on drain
+    def do_close() -> None:
+        trans.close()
+        close_returned.set()
+
+    close_thread = threading.Thread(target=do_close)
+    close_thread.start()
+
+    import time
+    time.sleep(0.1)
+    # close() should still be waiting
+    assert not close_returned.is_set()
+
+    # Let the request complete
+    request_may_finish.set()
+    req_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert close_returned.is_set()
+    assert request_result.get("status") == 200
+    assert trans._client.is_closed
+
+
+@respx_mock
+def test_double_close_concurrent():
+    """Two concurrent close() calls both block until drain completes."""
+    import threading
+
+    trans = HttpTransport(api_token=TEST_TOKEN)
+
+    request_started = threading.Event()
+    request_may_finish = threading.Event()
+
+    def slow_response(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+        request_may_finish.wait(timeout=5)
+        return httpx.Response(200, json={"ok": True})
+
+    respx_mock.get(FULL_TEST_URL).mock(side_effect=slow_response)
+
+    def do_request() -> None:
+        trans.request("GET", TEST_API_ENDPOINT_PATH)
+
+    req_thread = threading.Thread(target=do_request)
+    req_thread.start()
+    request_started.wait(timeout=5)
+
+    close_results: list[bool] = []
+
+    def do_close() -> None:
+        trans.close()
+        close_results.append(True)
+
+    close1 = threading.Thread(target=do_close)
+    close2 = threading.Thread(target=do_close)
+    close1.start()
+    close2.start()
+
+    import time
+    time.sleep(0.1)
+    # Neither close should have returned yet
+    assert len(close_results) == 0
+
+    request_may_finish.set()
+    req_thread.join(timeout=5)
+    close1.join(timeout=5)
+    close2.join(timeout=5)
+
+    # Both close() calls completed without deadlock
+    assert len(close_results) == 2
+    assert trans._client.is_closed
