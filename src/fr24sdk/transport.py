@@ -265,11 +265,17 @@ class HttpTransport:
 
         Waits for any in-flight requests to complete before closing.
         Subsequent calls to :meth:`request` will raise
-        :class:`~fr24sdk.exceptions.TransportError`.
+        :class:`~fr24sdk.exceptions.TransportError`.  Concurrent callers
+        block until the close is fully complete.
         """
         if not hasattr(self, "_active"):
             return
         with self._lock:
+            if self._close_pending:
+                # Another thread is already closing — wait for it.
+                while self._close_pending:
+                    self._drained.wait()
+                return
             if self._closed:
                 return
             self._closed = True
@@ -277,10 +283,12 @@ class HttpTransport:
             ref = self._active
             while ref.inflight > 0:
                 self._drained.wait()
-            if not ref.client.is_closed:
-                ref.client.close()
-            self._close_pending = False
-            self._drained.notify_all()
+            try:
+                if not ref.client.is_closed:
+                    ref.client.close()
+            finally:
+                self._close_pending = False
+                self._drained.notify_all()
 
     def reset(self) -> None:
         """Closes the current HTTP client and creates a fresh one.
