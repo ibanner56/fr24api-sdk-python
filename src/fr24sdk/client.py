@@ -98,7 +98,9 @@ class Client:
         resource-constrained devices where periodic recycling prevents
         socket accumulation.
 
-        Not thread-safe — do not call while requests are in-flight.
+        Thread-safe: waits for in-flight requests to complete before
+        closing the old pool.  New requests use the replacement pool
+        immediately.
 
         Raises:
             RuntimeError: If the client was created with a

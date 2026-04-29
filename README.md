@@ -217,10 +217,12 @@ while True:
         client.reset()  # Recycle the connection pool
 ```
 
-> **Note:** `reset()` is not thread-safe and must not be called while requests
-> are in-flight.  It is not supported when a custom `http_client` was provided
-> to the constructor.  Avoid calling it too frequently — each reset closes all
-> pooled connections, which temporarily increases reconnect and TIME_WAIT churn.
+> **Note:** `reset()` is thread-safe — it waits for in-flight requests to
+> complete before closing the old pool.  New requests that arrive during a
+> reset use the replacement pool immediately.  It is not supported when a
+> custom `http_client` was provided to the constructor.  Avoid calling it
+> too frequently — each reset closes all pooled connections, which
+> temporarily increases reconnect and TIME_WAIT churn.
 
 ## Contributing
 
