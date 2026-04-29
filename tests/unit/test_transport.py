@@ -13,8 +13,10 @@ from fr24sdk.transport import (
     HttpTransport,
     DEFAULT_BASE_URL,
     DEFAULT_API_VERSION,
-    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TIMEOUT,
     DEFAULT_USER_AGENT,
+    DEFAULT_POOL_LIMITS,
+    DEFAULT_RETRIES,
 )
 from fr24sdk.exceptions import (
     ApiError,
@@ -77,7 +79,7 @@ def test_transport_initialization_defaults():
     assert trans.api_token == TEST_TOKEN
     assert trans.base_url == DEFAULT_BASE_URL
     assert trans.api_version == DEFAULT_API_VERSION
-    assert trans.timeout == DEFAULT_TIMEOUT_SECONDS
+    assert trans.timeout == DEFAULT_TIMEOUT
     assert isinstance(trans._client, httpx.Client)
     trans.close()
 
@@ -329,3 +331,175 @@ def test_transport_explicit_close() -> None:  # respx_router fixture removed
 
     assert route.called
     assert raw_client_passed_to_transport.is_closed
+
+
+# --- Connection pool limits tests ---
+
+
+def test_default_pool_limits_applied():
+    """When no http_client or limits are given, SDK defaults are applied."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    pool = trans._client._transport._pool
+    assert pool._max_connections == DEFAULT_POOL_LIMITS.max_connections
+    assert pool._max_keepalive_connections == DEFAULT_POOL_LIMITS.max_keepalive_connections
+    assert pool._keepalive_expiry == DEFAULT_POOL_LIMITS.keepalive_expiry
+    trans.close()
+
+
+def test_custom_limits_applied():
+    """User-supplied limits override the defaults."""
+    custom_limits = httpx.Limits(
+        max_connections=3, max_keepalive_connections=1, keepalive_expiry=2
+    )
+    trans = HttpTransport(api_token=TEST_TOKEN, limits=custom_limits)
+    pool = trans._client._transport._pool
+    assert pool._max_connections == 3
+    assert pool._max_keepalive_connections == 1
+    assert pool._keepalive_expiry == 2
+    trans.close()
+
+
+def test_user_provided_http_client_ignores_limits():
+    """When http_client is provided, limits param is irrelevant."""
+    user_client = httpx.Client(
+        base_url="http://example.com",
+        limits=httpx.Limits(max_connections=42),
+    )
+    custom_limits = httpx.Limits(max_connections=1)
+    trans = HttpTransport(
+        api_token=TEST_TOKEN, http_client=user_client, limits=custom_limits
+    )
+    # The user's client should be used as-is
+    assert trans._client is user_client
+    assert trans._client._transport._pool._max_connections == 42
+    trans.close()
+
+
+# --- reset() tests ---
+
+
+@respx_mock
+def test_reset_creates_new_working_client():
+    """reset() closes the old client and creates a functional replacement."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    old_client = trans._client
+
+    trans.reset()
+
+    assert old_client.is_closed
+    assert not trans._client.is_closed
+    assert trans._client is not old_client
+
+    # New client should be functional
+    route = respx_mock.get(FULL_TEST_URL).respond(200, json={"ok": True})
+    response = trans.request("GET", TEST_API_ENDPOINT_PATH)
+    assert response.status_code == 200
+    assert route.called
+    trans.close()
+
+
+def test_reset_preserves_pool_limits():
+    """reset() re-applies the same pool limits to the new client."""
+    custom_limits = httpx.Limits(
+        max_connections=7, max_keepalive_connections=2, keepalive_expiry=3
+    )
+    trans = HttpTransport(api_token=TEST_TOKEN, limits=custom_limits)
+    trans.reset()
+    pool = trans._client._transport._pool
+    assert pool._max_connections == 7
+    assert pool._max_keepalive_connections == 2
+    assert pool._keepalive_expiry == 3
+    trans.close()
+
+
+def test_reset_raises_for_user_provided_client():
+    """reset() raises RuntimeError when the transport uses an external client."""
+    user_client = httpx.Client(base_url="http://example.com")
+    trans = HttpTransport(api_token=TEST_TOKEN, http_client=user_client)
+    with pytest.raises(RuntimeError, match="user-supplied http_client"):
+        trans.reset()
+    # Original client should still be usable
+    assert not user_client.is_closed
+    trans.close()
+
+
+# --- Connection hardening tests ---
+
+
+def test_default_retries_configured():
+    """SDK-created clients use connection-establishment retries."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    # retries are set on the HTTPTransport, which is _client._transport
+    http_transport = trans._client._transport
+    assert isinstance(http_transport, httpx.HTTPTransport)
+    assert http_transport._pool._retries == DEFAULT_RETRIES
+    trans.close()
+
+
+def test_custom_retries():
+    """User can override the retry count."""
+    trans = HttpTransport(api_token=TEST_TOKEN, retries=5)
+    assert trans._client._transport._pool._retries == 5
+    trans.close()
+
+
+def test_socket_options_include_keepalive():
+    """SDK-created clients enable SO_KEEPALIVE on sockets."""
+    import socket as _socket
+
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    pool = trans._client._transport._pool
+    sock_opts = pool._socket_options
+    # SO_KEEPALIVE must always be present
+    assert (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1) in sock_opts
+    # TCP keepalive tuning constants should be present when the platform supports them
+    if hasattr(_socket, "TCP_KEEPIDLE"):
+        assert (_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 60) in sock_opts
+    if hasattr(_socket, "TCP_KEEPINTVL"):
+        assert (_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10) in sock_opts
+    if hasattr(_socket, "TCP_KEEPCNT"):
+        assert (_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3) in sock_opts
+    trans.close()
+
+
+def test_granular_timeout_default():
+    """Default timeout uses granular connect/read/write/pool values."""
+    trans = HttpTransport(api_token=TEST_TOKEN)
+    client_timeout = trans._client.timeout
+    assert client_timeout.connect == 5
+    assert client_timeout.read == 30
+    assert client_timeout.write == 10
+    assert client_timeout.pool == 5
+    trans.close()
+
+
+def test_float_timeout_backwards_compat():
+    """Passing a plain float still works (applied to all timeout fields)."""
+    trans = HttpTransport(api_token=TEST_TOKEN, timeout=15.0)
+    client_timeout = trans._client.timeout
+    assert client_timeout.connect == 15.0
+    assert client_timeout.read == 15.0
+    trans.close()
+
+
+def test_httpx_timeout_object_passthrough():
+    """Passing an httpx.Timeout object is used as-is."""
+    custom = httpx.Timeout(connect=3, read=60, write=5, pool=2)
+    trans = HttpTransport(api_token=TEST_TOKEN, timeout=custom)
+    client_timeout = trans._client.timeout
+    assert client_timeout.connect == 3
+    assert client_timeout.read == 60
+    assert client_timeout.pool == 2
+    trans.close()
+
+
+def test_reset_preserves_retries_and_socket_options():
+    """reset() recreates the client with the same retries and socket opts."""
+    import socket as _socket
+
+    trans = HttpTransport(api_token=TEST_TOKEN, retries=4)
+    trans.reset()
+    assert trans._client._transport._pool._retries == 4
+    sock_opts = trans._client._transport._pool._socket_options
+    assert (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1) in sock_opts
+    trans.close()

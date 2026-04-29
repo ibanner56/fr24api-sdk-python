@@ -171,6 +171,57 @@ client = Client()
 client.close()
 ```
 
+### 7. Connection Management for Long-Running Processes
+
+The SDK is hardened out of the box for long-lived use on resource-constrained
+devices.  The defaults below apply automatically when you create a `Client()`
+without a custom `http_client`:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| Pool limits | 10 max connections, 5 keepalive, 120 s expiry | Caps socket usage, prevents unbounded pool growth |
+| TCP keepalive | `SO_KEEPALIVE` + tuned `KEEPIDLE`/`INTVL`/`CNT` | Detects dead peers, prevents stale NAT/firewall entries |
+| Connect retries | 2 | Survives transient DNS and TCP connect failures |
+| Granular timeout | connect=5 s, read=30 s, write=10 s, pool=5 s | Fails fast on connect/pool stalls instead of blocking 30 s |
+
+All of these are configurable:
+
+```python
+import httpx
+from fr24sdk.client import Client
+
+client = Client(
+    limits=httpx.Limits(max_connections=3, max_keepalive_connections=1),
+    timeout=httpx.Timeout(connect=5, read=60, write=10, pool=3),
+    retries=3,
+)
+```
+
+For long-running processes (e.g., continuous monitoring scripts), you can
+periodically recycle the connection pool without recreating the client:
+
+```python
+from datetime import datetime, timedelta, timezone
+
+client = Client()
+request_count = 0
+while True:
+    now = datetime.now(timezone.utc)
+    result = client.flight_summary.get_light(
+        callsigns=["..."],
+        flight_datetime_from=now - timedelta(hours=1),
+        flight_datetime_to=now,
+    )
+    request_count += 1
+    if request_count % 1000 == 0:
+        client.reset()  # Recycle the connection pool
+```
+
+> **Note:** `reset()` is not thread-safe and must not be called while requests
+> are in-flight.  It is not supported when a custom `http_client` was provided
+> to the constructor.  Avoid calling it too frequently — each reset closes all
+> pooled connections, which temporarily increases reconnect and TIME_WAIT churn.
+
 ## Contributing
 
 Contributions are welcome! Please see `CONTRIBUTING.md` for guidelines.
